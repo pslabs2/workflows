@@ -130,9 +130,6 @@ jobs:
         with:
           images: ${{ steps.vars.outputs.image }}
           tags: ${{ steps.vars.outputs.tags }}
-            type=semver,pattern={{{{major}}}}.{{{{minor}}}}
-            type=sha
-            type=raw,value=latest,enable={{{{is_default_branch}}}}') }}
 
       - name: Set up QEMU
         if: inputs.platforms != 'linux/amd64'
