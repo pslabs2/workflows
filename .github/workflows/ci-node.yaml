@@ -1,0 +1,113 @@
+name: CI - Node
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version (ignored if node-version-file is set)
+        type: string
+        default: "22"
+      node-version-file:
+        description: File containing the Node.js version (e.g. .nvmrc, package.json)
+        type: string
+        default: ""
+      working-directory:
+        description: Directory containing package.json
+        type: string
+        default: "."
+      package-manager:
+        description: "Package manager: npm, pnpm or yarn"
+        type: string
+        default: npm
+      run-lint:
+        description: Run the `lint` script if present
+        type: boolean
+        default: true
+      run-test:
+        description: Run the `test` script if present
+        type: boolean
+        default: true
+      run-build:
+        description: Run the `build` script if present
+        type: boolean
+        default: true
+      runs-on:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Lint, test & build
+    runs-on: ${{ inputs.runs-on }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      PM: ${{ inputs.package-manager }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate package manager
+        run: |
+          case "$PM" in
+            npm|pnpm|yarn) ;;
+            *) echo "::error::Unsupported package-manager '$PM' (use npm, pnpm or yarn)"; exit 1 ;;
+          esac
+
+      - name: Set up pnpm
+        if: inputs.package-manager == 'pnpm'
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: ${{ inputs.working-directory }}/package.json
+
+      - name: Enable corepack (yarn)
+        if: inputs.package-manager == 'yarn'
+        run: corepack enable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: ${{ inputs.package-manager }}
+          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || inputs.package-manager == 'yarn' && 'yarn.lock' || 'package-lock.json' }}
+
+      - name: Install dependencies
+        run: |
+          case "$PM" in
+            npm)  npm ci ;;
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn)
+              if [ -f .yarnrc.yml ]; then yarn install --immutable; else yarn install --frozen-lockfile; fi
+              ;;
+          esac
+
+      - name: Define script runner
+        run: |
+          cat > "$RUNNER_TEMP/run-script.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          script="$1"
+          if node -e "process.exit(require('./package.json').scripts?.['$script'] ? 0 : 1)"; then
+            "$PM" run "$script"
+          else
+            echo "No '$script' script in package.json, skipping"
+          fi
+          EOF
+          chmod +x "$RUNNER_TEMP/run-script.sh"
+
+      - name: Lint
+        if: inputs.run-lint
+        run: '"$RUNNER_TEMP/run-script.sh" lint'
+
+      - name: Test
+        if: inputs.run-test
+        run: '"$RUNNER_TEMP/run-script.sh" test'
+
+      - name: Build
+        if: inputs.run-build
+        run: '"$RUNNER_TEMP/run-script.sh" build'

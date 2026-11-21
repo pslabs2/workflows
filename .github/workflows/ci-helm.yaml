@@ -1,0 +1,134 @@
+name: CI - Helm
+
+on:
+  workflow_call:
+    inputs:
+      chart-path:
+        description: Path to a chart directory, or a directory containing multiple charts
+        type: string
+        default: charts
+      helm-version:
+        description: Helm version
+        type: string
+        default: latest
+      values-file:
+        description: Optional values file (relative to each chart) used for lint/template
+        type: string
+        default: ""
+      kubernetes-version:
+        description: Kubernetes version to validate rendered manifests against (kubeconform)
+        type: string
+        default: "1.31.0"
+      run-kubeconform:
+        description: Validate rendered manifests with kubeconform
+        type: boolean
+        default: true
+      strict-lint:
+        description: Run helm lint with --strict
+        type: boolean
+        default: true
+      runs-on:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Lint & validate charts
+    runs-on: ${{ inputs.runs-on }}
+    env:
+      CHART_PATH: ${{ inputs.chart-path }}
+      VALUES_FILE: ${{ inputs.values-file }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: ${{ inputs.helm-version }}
+
+      - name: Discover charts
+        id: charts
+        run: |
+          if [ -f "$CHART_PATH/Chart.yaml" ]; then
+            charts="$CHART_PATH"
+          else
+            charts=""
+            while read -r f; do
+              dir=$(dirname "$f")
+              # Skip subcharts (<parent>/charts/<sub>/Chart.yaml)
+              if [ "$(basename "$(dirname "$dir")")" = charts ] && [ -f "$(dirname "$(dirname "$dir")")/Chart.yaml" ]; then
+                continue
+              fi
+              charts+="$dir"$'\n'
+            done < <(find "$CHART_PATH" -name Chart.yaml | sort)
+            charts=${charts%$'\n'}
+          fi
+          if [ -z "$charts" ]; then
+            echo "::error::No charts found under '$CHART_PATH'"
+            exit 1
+          fi
+          echo "Found charts:"; echo "$charts"
+          {
+            echo "list<<EOF"
+            echo "$charts"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build dependencies
+        env:
+          CHARTS: ${{ steps.charts.outputs.list }}
+        run: |
+          while read -r chart; do
+            if grep -q '^dependencies:' "$chart/Chart.yaml"; then
+              # Add any HTTP repositories referenced by dependencies
+              grep -E '^\s*repository:\s*https?://' "$chart/Chart.yaml" | awk '{print $2}' | tr -d '"'"'" | sort -u | \
+                while read -r repo; do helm repo add "$(echo "$repo" | md5sum | cut -c1-8)" "$repo" >/dev/null; done
+              helm dependency build "$chart"
+            fi
+          done <<< "$CHARTS"
+
+      - name: Helm lint
+        env:
+          CHARTS: ${{ steps.charts.outputs.list }}
+          STRICT: ${{ inputs.strict-lint && '--strict' || '' }}
+        run: |
+          while read -r chart; do
+            args=()
+            if [ -n "$VALUES_FILE" ]; then args+=(-f "$chart/$VALUES_FILE"); fi
+            # shellcheck disable=SC2086
+            helm lint "$chart" $STRICT "${args[@]}"
+          done <<< "$CHARTS"
+
+      - name: Helm template
+        env:
+          CHARTS: ${{ steps.charts.outputs.list }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/rendered"
+          while read -r chart; do
+            args=()
+            if [ -n "$VALUES_FILE" ]; then args+=(-f "$chart/$VALUES_FILE"); fi
+            name=$(basename "$chart")
+            helm template "$name" "$chart" "${args[@]}" > "$RUNNER_TEMP/rendered/$name.yaml"
+          done <<< "$CHARTS"
+
+      - name: Set up kubeconform
+        if: inputs.run-kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP" kubeconform
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Validate manifests (kubeconform)
+        if: inputs.run-kubeconform
+        env:
+          KUBE_VERSION: ${{ inputs.kubernetes-version }}
+        run: |
+          kubeconform -strict -summary -ignore-missing-schemas \
+            -kubernetes-version "$KUBE_VERSION" \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            "$RUNNER_TEMP"/rendered/*.yaml

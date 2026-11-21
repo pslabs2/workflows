@@ -1,0 +1,101 @@
+name: CI - Go
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        description: Go version (ignored if go-version-file is set)
+        type: string
+        default: ""
+      go-version-file:
+        description: File containing the Go version
+        type: string
+        default: go.mod
+      working-directory:
+        description: Directory containing go.mod
+        type: string
+        default: "."
+      run-lint:
+        description: Run gofmt, go vet and golangci-lint
+        type: boolean
+        default: true
+      golangci-lint-version:
+        description: golangci-lint version
+        type: string
+        default: latest
+      run-test:
+        description: Run go test
+        type: boolean
+        default: true
+      race:
+        description: Enable the race detector in tests
+        type: boolean
+        default: true
+      run-build:
+        description: Run go build
+        type: boolean
+        default: true
+      runs-on:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Lint, test & build
+    runs-on: ${{ inputs.runs-on }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ inputs.go-version }}
+          go-version-file: ${{ inputs.go-version == '' && format('{0}/{1}', inputs.working-directory, inputs.go-version-file) || '' }}
+          cache-dependency-path: ${{ inputs.working-directory }}/go.sum
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Verify go.mod is tidy
+        if: inputs.run-lint
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: gofmt
+        if: inputs.run-lint
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        if: inputs.run-lint
+        run: go vet ./...
+
+      - name: golangci-lint
+        if: inputs.run-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ inputs.golangci-lint-version }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: go test
+        if: inputs.run-test
+        env:
+          RACE: ${{ inputs.race && '-race' || '' }}
+        run: go test ${RACE:+"$RACE"} -coverprofile=coverage.out ./...
+
+      - name: go build
+        if: inputs.run-build
+        run: go build ./...

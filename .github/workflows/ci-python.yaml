@@ -1,0 +1,105 @@
+name: CI - Python
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: Python version (ignored if python-version-file is set)
+        type: string
+        default: "3.13"
+      python-version-file:
+        description: File containing the Python version (e.g. .python-version, pyproject.toml)
+        type: string
+        default: ""
+      working-directory:
+        description: Project directory
+        type: string
+        default: "."
+      install-command:
+        description: Command to install dependencies (auto-detected if empty)
+        type: string
+        default: ""
+      run-lint:
+        description: Run ruff lint and format checks
+        type: boolean
+        default: true
+      run-typecheck:
+        description: Run mypy
+        type: boolean
+        default: false
+      run-test:
+        description: Run pytest
+        type: boolean
+        default: true
+      test-args:
+        description: Extra arguments passed to pytest
+        type: string
+        default: ""
+      runs-on:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Lint & test
+    runs-on: ${{ inputs.runs-on }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ inputs.python-version-file == '' && inputs.python-version || '' }}
+          python-version-file: ${{ inputs.python-version-file }}
+          cache: pip
+          cache-dependency-path: |
+            ${{ inputs.working-directory }}/requirements*.txt
+            ${{ inputs.working-directory }}/pyproject.toml
+
+      - name: Install dependencies
+        env:
+          INSTALL_COMMAND: ${{ inputs.install-command }}
+        run: |
+          python -m pip install --upgrade pip
+          if [ -n "$INSTALL_COMMAND" ]; then
+            eval "$INSTALL_COMMAND"
+          else
+            if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+            if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+            if [ -f pyproject.toml ] || [ -f setup.py ]; then
+              pip install -e ".[dev]" 2>/dev/null || pip install -e .
+            fi
+          fi
+          pip install ruff mypy pytest
+
+      - name: Ruff lint
+        if: inputs.run-lint
+        run: ruff check --output-format=github .
+
+      - name: Ruff format check
+        if: inputs.run-lint
+        run: ruff format --check .
+
+      - name: Mypy
+        if: inputs.run-typecheck
+        run: mypy .
+
+      - name: Pytest
+        if: inputs.run-test
+        env:
+          TEST_ARGS: ${{ inputs.test-args }}
+        run: |
+          set +e
+          # shellcheck disable=SC2086
+          pytest $TEST_ARGS
+          rc=$?
+          # Exit code 5 = no tests collected
+          if [ "$rc" -eq 5 ]; then echo "No tests collected, skipping"; exit 0; fi
+          exit "$rc"
