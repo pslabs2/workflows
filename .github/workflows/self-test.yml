@@ -1,0 +1,78 @@
+name: Self-test
+
+# Exercises the reusable CI workflow against the fixtures in tests/fixtures.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Lint workflows
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+
+  go:
+    name: Go
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+      packages: write
+      id-token: write
+      attestations: write
+    with:
+      language: go
+      working-directory: tests/fixtures/go
+      coverage-threshold: 40
+      enable-docker: true
+      docker-context: tests/fixtures/go
+      dockerfile: tests/fixtures/go/Dockerfile
+      image-name: ghcr.io/${{ github.repository }}/ci-fixture-go
+      push-image: false
+
+  python:
+    name: Python
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+      packages: write
+      id-token: write
+      attestations: write
+    with:
+      language: python
+      working-directory: tests/fixtures/python
+      compose-file: compose.yaml
+      coverage-threshold: 80
+
+  node:
+    name: Node.js
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+      packages: write
+      id-token: write
+      attestations: write
+    with:
+      language: node
+      working-directory: tests/fixtures/node
+      coverage-threshold: 80
