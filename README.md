@@ -72,6 +72,9 @@ jobs:
 > The caller must grant **all** of the permissions above, even when `enable-docker` is
 > `false`: GitHub validates the permissions of every job in a reusable workflow up front.
 
+Dependency review needs the **dependency graph** enabled on the calling repository
+(Settings → Advanced Security). Otherwise set `enable-dependency-review: false`.
+
 Mark the **`CI result`** check as required in branch protection — it fails if any stage failed.
 
 ### Inputs

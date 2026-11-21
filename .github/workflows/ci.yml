@@ -612,12 +612,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Dependency review
-        if: inputs.enable-dependency-review && github.event_name == 'pull_request'
-        uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
-        with:
-          fail-on-severity: ${{ inputs.dependency-review-fail-on-severity }}
-
       # ---- Runtime setup + dependency caching (keep in sync across jobs) ----
       - name: Setup pnpm
         if: inputs.language == 'node' && needs.plan.outputs.package-manager == 'pnpm'
@@ -657,6 +651,7 @@ jobs:
 
       # pip-audit and govulncheck inspect the installed dependency set; JS audits read the lockfile.
       - name: Install dependencies
+        id: install
         if: needs.plan.outputs.audit != '' && inputs.language != 'node' && needs.plan.outputs.install != ''
         env:
           CMD: ${{ needs.plan.outputs.install }}
@@ -667,6 +662,13 @@ jobs:
         env:
           CMD: ${{ needs.plan.outputs.audit }}
         run: eval "$CMD"
+
+      # Runs even if the audit failed so both results are reported.
+      - name: Dependency review
+        if: ${{ !cancelled() && inputs.enable-dependency-review && github.event_name == 'pull_request' }}
+        uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
+        with:
+          fail-on-severity: ${{ inputs.dependency-review-fail-on-severity }}
 
   secret-scan:
     name: Security / Secrets
