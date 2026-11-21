@@ -1,0 +1,175 @@
+name: CD - Go
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        description: Go version passed as the GO_VERSION build arg (empty = read from go-version-file)
+        type: string
+        default: ""
+      go-version-file:
+        description: go.mod-style file whose `go` directive is used when go-version is empty (empty = don't pass)
+        type: string
+        default: go.mod
+      working-directory:
+        description: Docker build context
+        type: string
+        default: "."
+      dockerfile:
+        description: Path to the Dockerfile, relative to working-directory
+        type: string
+        default: Dockerfile
+      image-name:
+        description: Image name under ghcr.io/<owner>/ (defaults to the repository name)
+        type: string
+        default: ""
+      platforms:
+        description: Comma-separated target platforms
+        type: string
+        default: linux/amd64,linux/arm64
+      build-args:
+        description: Extra build args, one KEY=VALUE per line
+        type: string
+        default: ""
+      target:
+        description: Dockerfile target stage
+        type: string
+        default: ""
+      tags:
+        description: docker/metadata-action tag rules (defaults to branch, PR, semver, sha and latest on the default branch)
+        type: string
+        default: ""
+      push:
+        description: Push the image to GHCR (never pushed on pull_request events)
+        type: boolean
+        default: true
+      attest:
+        description: Generate and push a build provenance attestation (requires id-token and attestations write)
+        type: boolean
+        default: true
+      runs-on:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+    outputs:
+      image:
+        description: Fully qualified image name (without tag)
+        value: ${{ jobs.cd.outputs.image }}
+      digest:
+        description: Image digest
+        value: ${{ jobs.cd.outputs.digest }}
+      tags:
+        description: Newline-separated list of image tags
+        value: ${{ jobs.cd.outputs.tags }}
+
+permissions:
+  contents: read
+
+jobs:
+  cd:
+    name: Build & publish image
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve image and build args
+        id: vars
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+          VERSION: ${{ inputs.go-version }}
+          VERSION_FILE: ${{ inputs.go-version-file }}
+          EXTRA_BUILD_ARGS: ${{ inputs.build-args }}
+          TAGS: ${{ inputs.tags }}
+          PUSH: ${{ inputs.push && github.event_name != 'pull_request' }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            :
+          elif [ -n "$VERSION_FILE" ]; then
+            VERSION=$(awk '$1 == "go" { print $2; exit }' "$VERSION_FILE")
+            if [ -z "$VERSION" ]; then
+              echo "::error::No go directive found in $VERSION_FILE"; exit 1
+            fi
+          fi
+          image="ghcr.io/${OWNER}/${IMAGE_NAME:-$REPO}"
+          echo "image=${image,,}" >> "$GITHUB_OUTPUT"
+          echo "push=$PUSH" >> "$GITHUB_OUTPUT"
+          {
+            echo "build-args<<__EOF__"
+            if [ -n "$VERSION" ]; then echo "GO_VERSION=$VERSION"; fi
+            if [ -n "$EXTRA_BUILD_ARGS" ]; then printf '%s\n' "$EXTRA_BUILD_ARGS"; fi
+            echo "__EOF__"
+            echo "tags<<__EOF__"
+            if [ -n "$TAGS" ]; then
+              printf '%s\n' "$TAGS"
+            else
+              printf '%s\n' \
+                'type=ref,event=branch' \
+                'type=ref,event=pr' \
+                'type=semver,pattern={{version}}' \
+                'type=semver,pattern={{major}}.{{minor}}' \
+                'type=sha' \
+                'type=raw,value=latest,enable={{is_default_branch}}'
+            fi
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.vars.outputs.image }}
+          tags: ${{ steps.vars.outputs.tags }}
+            type=semver,pattern={{{{major}}}}.{{{{minor}}}}
+            type=sha
+            type=raw,value=latest,enable={{{{is_default_branch}}}}') }}
+
+      - name: Set up QEMU
+        if: inputs.platforms != 'linux/amd64'
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: steps.vars.outputs.push == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.working-directory }}
+          file: ${{ inputs.working-directory }}/${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          target: ${{ inputs.target }}
+          build-args: ${{ steps.vars.outputs.build-args }}
+          push: ${{ steps.vars.outputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          cache-from: type=gha,scope=${{ github.workflow }}-${{ steps.vars.outputs.image }}
+          cache-to: type=gha,mode=max,scope=${{ github.workflow }}-${{ steps.vars.outputs.image }}
+
+      - name: Attest build provenance
+        if: inputs.attest && steps.vars.outputs.push == 'true'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ steps.vars.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
