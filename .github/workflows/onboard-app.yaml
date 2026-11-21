@@ -1,0 +1,453 @@
+name: Onboard app
+
+# Onboards an application onto the GitOps infra repo (Argo CD app of apps):
+#   apps/<app>/values.yaml           values for the shared chart (charts/app)
+#   clusters/<cluster>/<app>.yaml    Argo CD Application, picked up by the root app
+# and commits them straight to the infra repo's branch. Re-running is a no-op once
+# the app is onboarded, unless `overwrite` is set.
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: App name, used for the Argo CD Application, Helm release and values directory (defaults to the repository name)
+        type: string
+        default: ""
+      namespace:
+        description: Kubernetes namespace (defaults to the app name)
+        type: string
+        default: ""
+      cluster:
+        description: Cluster directory under clusters/ in the infra repo
+        type: string
+        default: homelab
+      infra-repository:
+        description: GitOps repository (defaults to <owner>/infra)
+        type: string
+        default: ""
+      infra-ref:
+        description: Branch of the infra repo to commit to; also the Application's targetRevision
+        type: string
+        default: main
+      chart-path:
+        description: Path of the shared chart in the infra repo
+        type: string
+        default: charts/app
+      apps-path:
+        description: Directory of per-app values in the infra repo
+        type: string
+        default: apps
+      values-file:
+        description: Chart values in the app repo used as the starting point. If missing, components are discovered from Dockerfiles
+        type: string
+        default: deploy/values.yaml
+      values:
+        description: Extra chart values (YAML), deep-merged over values-file
+        type: string
+        default: ""
+      image-prefix:
+        description: Image name prefix; component <name> uses <prefix>-<name> unless its image.repository is set (defaults to ghcr.io/<owner>/<repo>)
+        type: string
+        default: ""
+      image-tag:
+        description: Image tag for components without image.tag (defaults to sha-<short commit SHA>, as tagged by the cd-* workflows)
+        type: string
+        default: ""
+      pin-digest:
+        description: Resolve each image tag to its digest and pin it (fails if an image doesn't exist)
+        type: boolean
+        default: true
+      ingress-host:
+        description: Host for components with ingress enabled and no host (defaults to <app>.localhost)
+        type: string
+        default: ""
+      overwrite:
+        description: Regenerate the files of an already onboarded app, discarding edits made in the infra repo
+        type: boolean
+        default: false
+      dry-run:
+        description: Generate and validate the files, but don't push
+        type: boolean
+        default: false
+      app-client-id:
+        description: Client ID of a GitHub App with contents write on the infra repo (use with the app-private-key secret)
+        type: string
+        default: ""
+      runs-on:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+    secrets:
+      app-private-key:
+        description: Private key of the GitHub App given in app-client-id
+        required: false
+      infra-token:
+        description: Token with contents write on the infra repo (fine-grained PAT), used when no GitHub App is given
+        required: false
+    outputs:
+      app-name:
+        description: App name
+        value: ${{ jobs.onboard.outputs.app-name }}
+      namespace:
+        description: Kubernetes namespace
+        value: ${{ jobs.onboard.outputs.namespace }}
+      changed:
+        description: Whether files were (or, on a dry run, would be) committed
+        value: ${{ jobs.onboard.outputs.changed }}
+      commit:
+        description: SHA of the infra commit (empty if nothing was pushed)
+        value: ${{ jobs.onboard.outputs.commit }}
+
+permissions:
+  contents: read
+
+jobs:
+  onboard:
+    name: Onboard to infra
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      packages: read
+    concurrency:
+      group: onboard-app-${{ github.repository }}-${{ inputs.app-name }}
+      cancel-in-progress: false
+    outputs:
+      app-name: ${{ steps.vars.outputs.app }}
+      namespace: ${{ steps.vars.outputs.namespace }}
+      changed: ${{ steps.generate.outputs.changed }}
+      commit: ${{ steps.push.outputs.commit }}
+    steps:
+      - name: Resolve settings
+        id: vars
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          SHA: ${{ github.sha }}
+          APP_NAME: ${{ inputs.app-name }}
+          NAMESPACE: ${{ inputs.namespace }}
+          CLUSTER: ${{ inputs.cluster }}
+          INFRA_REPOSITORY: ${{ inputs.infra-repository }}
+          IMAGE_PREFIX: ${{ inputs.image-prefix }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          INGRESS_HOST: ${{ inputs.ingress-host }}
+          CHART_PATH: ${{ inputs.chart-path }}
+          APPS_PATH: ${{ inputs.apps-path }}
+        run: |
+          # DNS-1123 label, short enough for Helm release names (53).
+          sanitize() { tr '[:upper:]' '[:lower:]' <<< "$1" | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//'; }
+          valid() { [[ ${#1} -le 53 && $1 =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; }
+
+          app=${APP_NAME:-$(sanitize "$REPO")}
+          namespace=${NAMESPACE:-$app}
+          for v in "app-name=$app" "namespace=$namespace" "cluster=$CLUSTER"; do
+            if ! valid "${v#*=}"; then
+              echo "::error::${v%%=*} '${v#*=}' must be a lowercase DNS label (a-z, 0-9, '-') of at most 53 characters"
+              exit 1
+            fi
+          done
+          for p in "$CHART_PATH" "$APPS_PATH"; do
+            if [[ -z $p || $p == /* || $p == *..* ]]; then
+              echo "::error::'$p' must be a relative path inside the infra repo"; exit 1
+            fi
+          done
+
+          prefix=${IMAGE_PREFIX:-ghcr.io/$OWNER/$REPO}
+          {
+            echo "app=$app"
+            echo "namespace=$namespace"
+            echo "infra-repo=${INFRA_REPOSITORY:-$OWNER/infra}"
+            echo "image-prefix=${prefix,,}"
+            echo "image-tag=${IMAGE_TAG:-sha-${SHA::7}}"
+            echo "ingress-host=${INGRESS_HOST:-$app.localhost}"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - name: Check credentials
+        id: auth
+        env:
+          APP_CLIENT_ID: ${{ inputs.app-client-id }}
+          HAS_APP_KEY: ${{ secrets.app-private-key != '' }}
+          HAS_TOKEN: ${{ secrets.infra-token != '' }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          INFRA_REPO: ${{ steps.vars.outputs.infra-repo }}
+        run: |
+          if [ -n "$APP_CLIENT_ID" ] && [ "$HAS_APP_KEY" = true ]; then
+            echo "method=app" >> "$GITHUB_OUTPUT"
+          elif [ -n "$APP_CLIENT_ID" ] || [ "$HAS_APP_KEY" = true ]; then
+            echo "::error::A GitHub App needs both the app-client-id input and the app-private-key secret"; exit 1
+          elif [ "$HAS_TOKEN" = true ]; then
+            echo "method=token" >> "$GITHUB_OUTPUT"
+          elif [ "$DRY_RUN" = true ]; then
+            echo "::notice::No infra credentials; the dry run reads $INFRA_REPO with the workflow token"
+            echo "method=none" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Writing to $INFRA_REPO needs credentials: pass app-client-id + the app-private-key secret, or the infra-token secret"
+            exit 1
+          fi
+          echo "owner=${INFRA_REPO%%/*}" >> "$GITHUB_OUTPUT"
+          echo "repo=${INFRA_REPO#*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub App token
+        id: app-token
+        if: steps.auth.outputs.method == 'app'
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ inputs.app-client-id }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ steps.auth.outputs.owner }}
+          repositories: ${{ steps.auth.outputs.repo }}
+          permission-contents: write
+
+      - name: Check out app
+        uses: actions/checkout@v7
+        with:
+          path: app
+          persist-credentials: false
+
+      - name: Check out infra
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ steps.vars.outputs.infra-repo }}
+          ref: ${{ inputs.infra-ref }}
+          path: infra
+          token: ${{ steps.app-token.outputs.token || secrets.infra-token || github.token }}
+          persist-credentials: ${{ !inputs.dry-run }}
+
+      - name: Log in to GHCR
+        if: inputs.pin-digest
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Generate manifests
+        id: generate
+        env:
+          APP: ${{ steps.vars.outputs.app }}
+          NAMESPACE: ${{ steps.vars.outputs.namespace }}
+          CLUSTER: ${{ inputs.cluster }}
+          INFRA_REPO: ${{ steps.vars.outputs.infra-repo }}
+          INFRA_REF: ${{ inputs.infra-ref }}
+          CHART_PATH: ${{ inputs.chart-path }}
+          APPS_PATH: ${{ inputs.apps-path }}
+          VALUES_FILE: ${{ inputs.values-file }}
+          EXTRA_VALUES: ${{ inputs.values }}
+          IMAGE_PREFIX: ${{ steps.vars.outputs.image-prefix }}
+          IMAGE_TAG: ${{ steps.vars.outputs.image-tag }}
+          INGRESS_HOST: ${{ steps.vars.outputs.ingress-host }}
+          PIN_DIGEST: ${{ inputs.pin-digest }}
+          OVERWRITE: ${{ inputs.overwrite }}
+          SOURCE_REPO: ${{ github.server_url }}/${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cluster_dir="infra/clusters/$CLUSTER"
+          app_file="$cluster_dir/$APP.yaml"
+          values_dir="infra/$APPS_PATH/$APP"
+          values_out="$values_dir/values.yaml"
+
+          if [ ! -f "infra/$CHART_PATH/Chart.yaml" ]; then
+            echo "::error::No chart at $INFRA_REPO/$CHART_PATH"; exit 1
+          fi
+          if [ ! -d "$cluster_dir" ]; then
+            echo "::error::No cluster directory $INFRA_REPO/clusters/$CLUSTER"; exit 1
+          fi
+
+          # An app counts as onboarded when its Application points back at this repo.
+          if [ -e "$app_file" ]; then
+            source=$(yq ea '[select(.kind == "Application" and .metadata.name == strenv(APP))
+              | .metadata.annotations."link.argocd.argoproj.io/source"] | .[0] // ""' "$app_file")
+            if [ "$source" != "$SOURCE_REPO" ]; then
+              echo "::error file=$app_file::${app_file#infra/} exists and was not onboarded from $SOURCE_REPO; set app-name"
+              exit 1
+            fi
+            if [ "$OVERWRITE" != true ]; then
+              echo "::notice::$APP is already onboarded to $INFRA_REPO (set overwrite to regenerate it)"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          elif [ -e "$values_dir" ]; then
+            echo "::error::${values_dir#infra/} exists without ${app_file#infra/}; remove it or set app-name"
+            exit 1
+          fi
+
+          # Other Applications may not reuse the name or namespace: resources are named
+          # after components, so two apps in one namespace would collide.
+          while IFS=$'\t' read -r file name ns; do
+            [ "$file" = "$app_file" ] && continue
+            if [ "$name" = "$APP" ]; then
+              echo "::error file=$file::An Application named $APP already exists in $file"; exit 1
+            fi
+            if [ "$ns" = "$NAMESPACE" ]; then
+              echo "::error file=$file::Namespace $NAMESPACE is already used by Application $name in $file; set namespace"; exit 1
+            fi
+          done < <(find "$cluster_dir" -name '*.y*ml' -print0 | xargs -0 -r yq ea \
+            '[select(.kind == "Application") | [filename, .metadata.name, (.spec.destination.namespace // "")] | @tsv] | .[]')
+
+          work=$(mktemp -d)
+
+          # 1. Base values: the app's values file, or components discovered from Dockerfiles.
+          if [ -f "app/$VALUES_FILE" ]; then
+            echo "Using app/$VALUES_FILE"
+            # Drop the file's leading comment block; it describes the app repo, not the infra copy.
+            awk 'body || !/^[[:space:]]*(#|$)/ { body = 1; print }' "app/$VALUES_FILE" > "$work/base.yaml"
+            [ -s "$work/base.yaml" ] || echo '{}' > "$work/base.yaml"
+          else
+            echo "No $VALUES_FILE; discovering components from Dockerfiles"
+            echo '{components: {}}' > "$work/base.yaml"
+            mapfile -t dockerfiles < <(cd app && find . -maxdepth 2 -name Dockerfile -not -path './.*/*' | sort)
+            if [ ${#dockerfiles[@]} -eq 0 ]; then
+              echo "::error::No $VALUES_FILE and no Dockerfile in the repo root or its subdirectories"; exit 1
+            fi
+            for df in "${dockerfiles[@]}"; do
+              dir=$(dirname "${df#./}")
+              port=$(grep -iE '^\s*EXPOSE\s+' "app/$df" | tail -n1 | awk '{print $2}' | cut -d/ -f1 || true)
+              if [ -z "$port" ]; then
+                echo "::error file=$df::No EXPOSE in $df; add one or describe the app in $VALUES_FILE"; exit 1
+              fi
+              if [ "$dir" = . ]; then
+                name=$(basename "$IMAGE_PREFIX") image=$IMAGE_PREFIX
+              else
+                name=$dir image="$IMAGE_PREFIX-$dir"
+              fi
+              name=$(tr '[:upper:]' '[:lower:]' <<< "$name")
+              image=${image,,}
+              echo "  $name: $image, port $port"
+              NAME=$name IMAGE=$image PORT=$port yq -i \
+                '.components[strenv(NAME)] = {"image": {"repository": strenv(IMAGE)}, "port": (strenv(PORT) | tonumber)}' \
+                "$work/base.yaml"
+            done
+            # Expose the frontend, or the only component.
+            yq -i '
+              (.components | keys) as $names |
+              with(select($names | length == 1); .components[$names[0]].ingress.enabled = true) |
+              with(select(.components | has("frontend")); .components.frontend.ingress.enabled = true)
+            ' "$work/base.yaml"
+          fi
+
+          # 2. Extra values from the caller, deep-merged on top.
+          if [ -n "$EXTRA_VALUES" ]; then printf '%s\n' "$EXTRA_VALUES"; else echo '{}'; fi > "$work/extra.yaml"
+          for f in base extra; do
+            if ! yq -e 'tag == "!!map"' "$work/$f.yaml" >/dev/null; then
+              echo "::error::The $f values must be a YAML mapping"; exit 1
+            fi
+          done
+          # Maps merge recursively; lists from the values input replace the base lists.
+          values="$work/values.yaml"
+          yq ea '. as $item ireduce ({}; . * $item)' "$work/base.yaml" "$work/extra.yaml" > "$values"
+
+          if [ "$(yq '.components // {} | length' "$values")" -eq 0 ]; then
+            echo "::error::No components to deploy"; exit 1
+          fi
+
+          # 3. Fill in images, ingress hosts and the release-specific defaults.
+          yq -i '
+            .components |= with_entries(
+              .value.image.repository = (.value.image.repository // (strenv(IMAGE_PREFIX) + "-" + .key)) |
+              .value.image.tag = (.value.image.tag // strenv(IMAGE_TAG)) |
+              with(select(.value.ingress.enabled == true and (.value.ingress.host // "") == "");
+                .value.ingress.host = strenv(INGRESS_HOST))
+            )
+          ' "$values"
+
+          if [ "$PIN_DIGEST" = true ]; then
+            while IFS=$'\t' read -r name ref; do
+              if ! digest=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' | jq -er .digest); then
+                echo "::error::Image $ref (component $name) not found. Publish it first (the cd-* workflows tag sha-<short sha>), set image-tag, or disable pin-digest"
+                exit 1
+              fi
+              echo "  $name: $ref@$digest"
+              NAME=$name DIGEST=$digest yq -i '.components[strenv(NAME)].image.digest = strenv(DIGEST)' "$values"
+            done < <(yq '.components | to_entries | .[] | select(.value.enabled != false) |
+              [.key, .value.image.repository + ":" + (.value.image.tag | tostring)] | @tsv' "$values")
+          fi
+
+          # 4. Write apps/<app>/values.yaml and clusters/<cluster>/<app>.yaml.
+          mkdir -p "$values_dir"
+          {
+            echo "# $APP: values for $CHART_PATH (see its values.yaml for every option)."
+            echo "# Onboarded from $SOURCE_REPO at ${SOURCE_SHA::7} by pslabs2/workflows onboard-app."
+            echo "# This file is now the source of truth: edit it here, e.g. to roll out a new image tag."
+            yq -P '.' "$values"
+          } > "$values_out"
+
+          values_rel=$(realpath -m --relative-to="infra/$CHART_PATH" "$values_out")
+          export VALUES_REL=$values_rel REPO_URL="https://github.com/$INFRA_REPO"
+          {
+            echo "# Onboarded from $SOURCE_REPO by pslabs2/workflows onboard-app."
+            echo "# Values: $APPS_PATH/$APP/values.yaml"
+            yq -n -P '
+              .apiVersion = "argoproj.io/v1alpha1" |
+              .kind = "Application" |
+              .metadata.name = strenv(APP) |
+              .metadata.namespace = "argocd" |
+              .metadata.annotations."link.argocd.argoproj.io/source" = strenv(SOURCE_REPO) |
+              .metadata.finalizers = ["resources-finalizer.argocd.argoproj.io/foreground"] |
+              .spec.project = "default" |
+              .spec.source.repoURL = strenv(REPO_URL) |
+              .spec.source.targetRevision = strenv(INFRA_REF) |
+              .spec.source.path = strenv(CHART_PATH) |
+              .spec.source.helm.releaseName = strenv(APP) |
+              .spec.source.helm.valueFiles = [strenv(VALUES_REL)] |
+              .spec.destination.server = "https://kubernetes.default.svc" |
+              .spec.destination.namespace = strenv(NAMESPACE) |
+              .spec.syncPolicy.automated.prune = true |
+              .spec.syncPolicy.automated.selfHeal = true |
+              .spec.syncPolicy.syncOptions = ["CreateNamespace=true"]
+            '
+          } > "$app_file"
+
+          # 5. Validate exactly what Argo CD will render.
+          helm lint "infra/$CHART_PATH" --strict -f "$values_out"
+          helm template "$APP" "infra/$CHART_PATH" -n "$NAMESPACE" -f "$values_out" > "$work/rendered.yaml"
+          echo "Rendered $(yq ea -N '[.kind + "/" + .metadata.name] | .[]' "$work/rendered.yaml" | paste -sd' ')"
+
+          git -C infra add -A
+          if git -C infra diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo "### Onboard \`$APP\` → \`$INFRA_REPO\`"
+            echo
+            echo "Namespace \`$NAMESPACE\`, cluster \`$CLUSTER\`."
+            for f in "$app_file" "$values_out"; do
+              echo
+              echo "<details><summary><code>${f#infra/}</code></summary>"
+              echo
+              echo '```yaml'
+              cat "$f"
+              echo '```'
+              echo "</details>"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit and push
+        id: push
+        if: steps.generate.outputs.changed == 'true' && !inputs.dry-run
+        working-directory: infra
+        env:
+          APP: ${{ steps.vars.outputs.app }}
+          INFRA_REF: ${{ inputs.infra-ref }}
+          SOURCE: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -m "Onboard $APP from $SOURCE" -m "Generated by pslabs2/workflows onboard-app: $RUN_URL"
+          # Other repos may push to the infra repo at the same time.
+          for attempt in 1 2 3 4 5; do
+            if git push -q origin "HEAD:$INFRA_REF"; then
+              echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+              echo "Pushed $(git rev-parse --short HEAD) to $INFRA_REF"
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt); rebasing"
+            sleep $((attempt * 3))
+            git pull -q --rebase origin "$INFRA_REF"
+          done
+          echo "::error::Could not push to $INFRA_REF"
+          exit 1
