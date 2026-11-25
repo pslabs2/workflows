@@ -75,7 +75,7 @@ Images are published as `ghcr.io/<owner>/<repo>` (override with `image-name`) an
 
 `onboard-app.yaml` commits two files straight to the infra repo's `main`:
 
-- `apps/<app>/values.yaml`: values for the shared chart `charts/app` (a Deployment, Service and optional Ingress per component)
+- `apps/<app>/values.yaml`: values for the shared chart `charts/app` (a Deployment, Service and optional Gateway API HTTPRoute per component, attached to the shared `traefik-gateway`)
 - `clusters/<cluster>/<app>.yaml`: an Argo CD Application (namespace `<app>`), which the root app syncs automatically
 
 ```yaml
@@ -89,13 +89,14 @@ Images are published as `ghcr.io/<owner>/<repo>` (override with `image-name`) an
       packages: read  # to resolve image digests
     with:
       app-client-id: ${{ vars.INFRA_APP_CLIENT_ID }}
-      # ingress-host: chat.example.com   # default <app>.localhost
+      # route-host: chat.example.com   # default <app>.localhost
     secrets:
       app-private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
       infra-token: ${{ secrets.INFRA_TOKEN }}  # used if no GitHub App is configured
 ```
 
-- **Components** come from `deploy/values.yaml` in the app repo (see [template-chat](https://github.com/pslabs2/template-chat/blob/main/deploy/values.yaml)). Without that file, every `Dockerfile` in the repo root or a subdirectory becomes a component, with its `EXPOSE` port and an ingress for `frontend` (or the only component). The `values` input is deep-merged on top.
+- **Components** come from `deploy/values.yaml` in the app repo (see [template-chat](https://github.com/pslabs2/template-chat/blob/main/deploy/values.yaml)). Without that file, every `Dockerfile` in the repo root or a subdirectory becomes a component, with its `EXPOSE` port and an HTTPRoute (`route.enabled`) for `frontend` (or the only component). The `values` input is deep-merged on top.
+- **Routing** uses the Gateway API. A component's `ingress` block is converted to `route` (`enabled`, `host`, `path`, `pathType: Exact`); the job fails if it sets `className`, `annotations`, `tls` or `pathType: ImplementationSpecific`, which have no HTTPRoute equivalent. `route-host` fills in routes without a host; `ingress-host` is a deprecated alias. The Application retries syncs until the Gateway API CRDs exist.
 - **Images** default to `ghcr.io/<owner>/<repo>-<component>:sha-<short sha>`, matching the `cd-*` workflows with `image-name: <repo>-<component>`, and are pinned by digest. The job fails if an image doesn't exist yet.
 - **Idempotent**: once onboarded, later runs only print a notice. Set `overwrite: true` to regenerate the files, which discards edits made in infra. The job refuses to reuse another Application's name or namespace.
 - **Credentials**: `GITHUB_TOKEN` can't write to another repo. Use a GitHub App installed on the infra repo with **Contents: read and write** (`app-client-id` + the `app-private-key` secret), or a fine-grained PAT with the same permission (the `infra-token` secret). Organization-level variables and secrets let every repo created from the template use them. `dry-run: true` renders and validates without credentials or pushing.

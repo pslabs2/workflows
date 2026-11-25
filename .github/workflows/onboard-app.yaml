@@ -57,8 +57,12 @@ on:
         description: Resolve each image tag to its digest and pin it (fails if an image doesn't exist)
         type: boolean
         default: true
+      route-host:
+        description: Host for components with a Gateway API route enabled and no host (defaults to <app>.localhost)
+        type: string
+        default: ""
       ingress-host:
-        description: Host for components with ingress enabled and no host (defaults to <app>.localhost)
+        description: Deprecated alias of route-host
         type: string
         default: ""
       overwrite:
@@ -129,6 +133,7 @@ jobs:
           INFRA_REPOSITORY: ${{ inputs.infra-repository }}
           IMAGE_PREFIX: ${{ inputs.image-prefix }}
           IMAGE_TAG: ${{ inputs.image-tag }}
+          ROUTE_HOST: ${{ inputs.route-host }}
           INGRESS_HOST: ${{ inputs.ingress-host }}
           CHART_PATH: ${{ inputs.chart-path }}
           APPS_PATH: ${{ inputs.apps-path }}
@@ -151,6 +156,11 @@ jobs:
             fi
           done
 
+          if [ -n "$INGRESS_HOST" ]; then
+            echo "::warning::ingress-host is deprecated; use route-host"
+          fi
+          route_host=${ROUTE_HOST:-${INGRESS_HOST:-$app.localhost}}
+
           prefix=${IMAGE_PREFIX:-ghcr.io/$OWNER/$REPO}
           {
             echo "app=$app"
@@ -158,7 +168,7 @@ jobs:
             echo "infra-repo=${INFRA_REPOSITORY:-$OWNER/infra}"
             echo "image-prefix=${prefix,,}"
             echo "image-tag=${IMAGE_TAG:-sha-${SHA::7}}"
-            echo "ingress-host=${INGRESS_HOST:-$app.localhost}"
+            echo "route-host=$route_host"
           } | tee -a "$GITHUB_OUTPUT"
 
       - name: Check credentials
@@ -234,7 +244,7 @@ jobs:
           EXTRA_VALUES: ${{ inputs.values }}
           IMAGE_PREFIX: ${{ steps.vars.outputs.image-prefix }}
           IMAGE_TAG: ${{ steps.vars.outputs.image-tag }}
-          INGRESS_HOST: ${{ steps.vars.outputs.ingress-host }}
+          ROUTE_HOST: ${{ steps.vars.outputs.route-host }}
           PIN_DIGEST: ${{ inputs.pin-digest }}
           OVERWRITE: ${{ inputs.overwrite }}
           SOURCE_REPO: ${{ github.server_url }}/${{ github.repository }}
@@ -320,8 +330,8 @@ jobs:
             # Expose the frontend, or the only component.
             yq -i '
               (.components | keys) as $names |
-              with(select($names | length == 1); .components[$names[0]].ingress.enabled = true) |
-              with(select(.components | has("frontend")); .components.frontend.ingress.enabled = true)
+              with(select($names | length == 1); .components[$names[0]].route.enabled = true) |
+              with(select(.components | has("frontend")); .components.frontend.route.enabled = true)
             ' "$work/base.yaml"
           fi
 
@@ -340,13 +350,40 @@ jobs:
             echo "::error::No components to deploy"; exit 1
           fi
 
-          # 3. Fill in images, ingress hosts and the release-specific defaults.
+          # 3. Expose components through the Gateway API: a legacy `ingress` becomes a `route`.
+          while IFS=$'\t' read -r name problem; do
+            [ -n "$name" ] || continue
+            if [ -n "$problem" ]; then
+              echo "::error::components.$name.ingress sets $problem, which has no HTTPRoute equivalent; replace it with components.$name.route"
+              exit 1
+            fi
+            echo "::notice::components.$name.ingress converted to an HTTPRoute (components.$name.route)"
+          done < <(yq '.components | to_entries | .[] | select(.value | has("ingress")) |
+            .value.ingress as $i |
+            [.key, ([
+              (if .value | has("route") then "route as well" else null end),
+              (if ($i.className // "") != "" then "className" else null end),
+              (if ($i.annotations // {} | length) > 0 then "annotations" else null end),
+              (if ($i.tls // [] | length) > 0 then "tls" else null end),
+              (if $i.pathType == "ImplementationSpecific" then "pathType ImplementationSpecific" else null end)
+            ] | map(select(. != null)) | join(", "))] | @tsv' "$values")
+          yq -i '
+            .components |= with_entries(
+              with(select(.value | has("ingress"));
+                .value.ingress as $i |
+                .value.route = ($i | pick(["enabled", "host", "path"])) |
+                with(select($i.pathType == "Exact"); .value.route.pathType = "Exact") |
+                del(.value.ingress))
+            )
+          ' "$values"
+
+          # 4. Fill in images, route hosts and the release-specific defaults.
           yq -i '
             .components |= with_entries(
               .value.image.repository = (.value.image.repository // (strenv(IMAGE_PREFIX) + "-" + .key)) |
               .value.image.tag = (.value.image.tag // strenv(IMAGE_TAG)) |
-              with(select(.value.ingress.enabled == true and (.value.ingress.host // "") == "");
-                .value.ingress.host = strenv(INGRESS_HOST))
+              with(select(.value.route.enabled == true and (.value.route.host // "") == "");
+                .value.route.host = strenv(ROUTE_HOST))
             )
           ' "$values"
 
@@ -362,7 +399,7 @@ jobs:
               [.key, .value.image.repository + ":" + (.value.image.tag | tostring)] | @tsv' "$values")
           fi
 
-          # 4. Write apps/<app>/values.yaml and clusters/<cluster>/<app>.yaml.
+          # 5. Write apps/<app>/values.yaml and clusters/<cluster>/<app>.yaml.
           mkdir -p "$values_dir"
           {
             echo "# $APP: values for $CHART_PATH (see its values.yaml for every option)."
@@ -393,11 +430,13 @@ jobs:
               .spec.destination.namespace = strenv(NAMESPACE) |
               .spec.syncPolicy.automated.prune = true |
               .spec.syncPolicy.automated.selfHeal = true |
-              .spec.syncPolicy.syncOptions = ["CreateNamespace=true"]
+              .spec.syncPolicy.syncOptions = ["CreateNamespace=true"] |
+              .spec.syncPolicy.retry = {"limit": 10, "backoff": {"duration": "10s", "factor": 2, "maxDuration": "3m"}} |
+              .spec.syncPolicy.retry line_comment = "until the Gateway API CRDs exist"
             '
           } > "$app_file"
 
-          # 5. Validate exactly what Argo CD will render.
+          # 6. Validate exactly what Argo CD will render.
           helm lint "infra/$CHART_PATH" --strict -f "$values_out"
           helm template "$APP" "infra/$CHART_PATH" -n "$NAMESPACE" -f "$values_out" > "$work/rendered.yaml"
           echo "Rendered $(yq ea -N '[.kind + "/" + .metadata.name] | .[]' "$work/rendered.yaml" | paste -sd' ')"
